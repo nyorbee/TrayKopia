@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover
     croniter = None
 
 APP_NAME = "TrayKopia"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 URL_FACEBOOK = "https://www.facebook.com/ajtiguy"
 URL_GITHUB = "https://github.com/nyorbee"
 
@@ -131,6 +131,9 @@ EN = {
     'Nie udało się uruchomić KopiaUI: {e}': 'Could not start KopiaUI: {e}',
     'Nie udało się zamontować: {m}': 'Mount failed: {m}',
     'Nie udało się zmienić autostartu: {e}': 'Could not change autostart: {e}',
+    'czeka na pierwszy snapshot (plan {w})': 'waiting for the first snapshot (planned {w})',
+    'Folder dodano do Kopii po ostatnim planowanym terminie. Możesz też kliknąć Snapshot Now w KopiaUI.':
+        'The folder was added to Kopia after the last planned time. You can also click Snapshot Now in KopiaUI.',
     'Nie znaleziono KopiaUI.exe.': 'KopiaUI.exe not found.',
     'Nie znaleziono kopia.exe': 'kopia.exe not found',
     'Nie znaleziono kopia.exe (zainstaluj KopiaUI albo wskaż plik w ustawieniach).': 'kopia.exe not found (install KopiaUI or set the path in settings).',
@@ -504,6 +507,7 @@ class Store:
         self.state.setdefault("events", {})       # repo_id -> zdarzenia z logów
         self.state.setdefault("auto", {})         # znaczniki wykonanych terminów automatycznych
         self.state.setdefault("acks", {})         # repo_id -> [id snapshotów z zatwierdzonym alarmem]
+        self.state.setdefault("first_seen", {})   # "repo_id|cel" -> kiedy TrayKopia pierwszy raz zobaczyła folder bez snapshotu
 
     def save_settings(self):
         with self.lock:
@@ -825,6 +829,7 @@ class SourceData:
         self.changed_since_last = None   # dla ignoreIdentical: czy coś się zmieniło od ostatniego snapshotu
         self.changed_checked_for = None
         self.est_size = None             # szacowany rozmiar folderu (do postępu pierwszego snapshotu)
+        self.first_seen = None           # dla folderu bez snapshotu: od kiedy TrayKopia go zna
 
     @property
     def target(self):
@@ -1301,6 +1306,10 @@ def _eval_source(src, ev, proc, kopiaui_running, now, server_age=None):
         return Status(ERROR, _("błąd snapshotu: {e}", e=ev.last_error_msg),
                       detail=det + [f"{fmt_when(ev.last_error, now)}: {ev.last_error_msg}",
                                     _("KopiaUI ponawia nieudany snapshot co 5 minut.")])
+    if not last and src.first_seen and due < src.first_seen:
+        # folder dodany po tym terminie – Kopia zrobi pierwszy snapshot o najbliższej zaplanowanej godzinie
+        return Status(WAIT, _("czeka na pierwszy snapshot (plan {w})", w=fmt_when(nxt, now) if nxt else "?"),
+                      detail=det + [_("Folder dodano do Kopii po ostatnim planowanym terminie. Możesz też kliknąć Snapshot Now w KopiaUI.")])
     if not kopiaui_running:
         return Status(ERROR, _("pominięta ({w}) – KopiaUI nie działa", w=fmt_when(due, now)),
                       detail=det + [_("Harmonogram działa tylko, gdy KopiaUI jest uruchomiona.")])
@@ -1993,6 +2002,7 @@ class Core:
                 try:
                     d = fetch_repo_data(self.kopia, repo, prev)
                     self._check_identical_changes(repo, d)
+                    self._mark_first_seen(repo, d)
                     for s in d.sources:
                         if not s.last_complete and s.est_size is None:
                             s.est_size = self.size_cache.get(s.path)
@@ -2017,6 +2027,25 @@ class Core:
                     self.data[rid] = d
                 self.refreshing = None
                 self.request_ui_update()
+
+    def _mark_first_seen(self, repo, d):
+        """Folder dodany do repozytorium, który jeszcze nie ma snapshotu: zapamiętaj, od kiedy go znamy.
+        Terminy sprzed tej chwili nie są „pominięte” – folderu wtedy jeszcze nie było w Kopii."""
+        fs = self.store.state.setdefault("first_seen", {})
+        changed = False
+        now = now_local()
+        for s in d.sources:
+            key = f"{repo.id}|{s.target}"
+            if s.snaps:
+                if fs.pop(key, None) is not None:
+                    changed = True
+                continue
+            if key not in fs:
+                fs[key] = to_iso(now)
+                changed = True
+            s.first_seen = from_iso(fs[key])
+        if changed:
+            self.store.save_state()
 
     def _start_size_job(self, path):
         """Policz rozmiar folderu w osobnym wątku (na zajętym HDD może to potrwać kilka minut)."""
@@ -2170,6 +2199,31 @@ def autostart_enabled():
         return False
 
 
+def refresh_autostart():
+    """Autostart włączony, ale exe przeniesiono w inne miejsce – popraw ścieżkę w rejestrze."""
+    if not IS_WIN:
+        return
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            cur, _t = winreg.QueryValueEx(k, APP_NAME)
+    except OSError:
+        return              # autostart wyłączony – nic nie robimy
+    if not (is_compiled() or getattr(sys, "frozen", False)):
+        return              # wersja .py (np. z PyCharma) nie przejmuje autostartu ustawionego dla exe
+    want = autostart_command()
+    old = str(cur).strip()
+    old_exe = old[1:].split('"', 1)[0] if old.startswith('"') else old.split(" ", 1)[0]
+    if old_exe and os.path.isfile(old_exe):
+        return              # stary plik dalej istnieje (np. druga kopia exe) – zostaw wybór użytkownika
+    if os.path.normcase(old) != os.path.normcase(want):
+        try:
+            set_autostart(True)
+            app_log(f"autostart: ścieżka zmieniona z {cur} na {want}")
+        except OSError as e:
+            app_log(f"autostart: nie udało się poprawić ścieżki: {e}")
+
+
 def set_autostart(on):
     if not IS_WIN:
         return
@@ -2194,6 +2248,26 @@ COLORS = {"ok": (46, 160, 67), "run": (43, 123, 214), "wait": (130, 130, 140), "
 
 ANIM_FRAMES = 36          # klatek na pełny obrót
 ANIM_INTERVAL_MS = 50    # ~20 kl./s -> obrót w 1,8 s
+
+
+_LOGO = {}
+
+
+def app_logo_image(size=64):
+    """Logo z traykopia.ico (zielone kółko z ptaszkiem); gdy pliku brak – narysowane."""
+    if size in _LOGO:
+        return _LOGO[size]
+    img = None
+    path = resource_path("traykopia.ico")
+    if path:
+        try:
+            from PIL import Image
+            with Image.open(path) as im:      # ICO otwiera się w największym rozmiarze
+                img = im.convert("RGBA").resize((size, size), Image.Resampling.LANCZOS)
+        except Exception:
+            img = None
+    _LOGO[size] = img or make_icon("ok", size=size)
+    return _LOGO[size]
 
 
 def make_icon(kind, frame=0, badge=None, size=64):
@@ -2293,24 +2367,26 @@ class WinTray:
                         ("guidItem", ctypes.c_byte * 16)]
         self.NII = NOTIFYICONIDENTIFIER
 
-    def hicon(self, key, pil_img):
-        hd = self.handles.get(key)
+    def hicon(self, key, pil_img, size=None):
+        size = size or self.small
+        hkey = (key, size)
+        hd = self.handles.get(hkey)
         if hd:
             return hd
         import tempfile
         tmp = os.path.join(tempfile.gettempdir(), f"traykopia_{os.getpid()}.ico")
-        sizes = sorted({16, 20, 24, 32, 40, 48, 64, self.small})
+        sizes = sorted({16, 20, 24, 32, 40, 48, 64, size})
         pil_img.save(tmp, format="ICO", sizes=[(x, x) for x in sizes])
         u = self.ct.WinDLL("user32")   # osobna instancja – nie ruszamy typów używanych przez pystray
         u.LoadImageW.restype = self.wt.HANDLE
         u.LoadImageW.argtypes = (self.wt.HINSTANCE, self.wt.LPCWSTR, self.wt.UINT, self.ct.c_int, self.ct.c_int, self.wt.UINT)
-        hd = u.LoadImageW(None, tmp, 1, self.small, self.small, 0x10)  # IMAGE_ICON, LR_LOADFROMFILE
+        hd = u.LoadImageW(None, tmp, 1, size, size, 0x10)  # IMAGE_ICON, LR_LOADFROMFILE
         try:
             os.remove(tmp)
         except OSError:
             pass
         if hd:
-            self.handles[key] = hd
+            self.handles[hkey] = hd
         return hd
 
     def set_icon(self, key, pil_img):
@@ -2322,6 +2398,21 @@ class WinTray:
             cbSize=self.ct.sizeof(w32.NOTIFYICONDATAW), hWnd=self.icon._hwnd, uID=0,
             uFlags=w32.NIF_ICON, hIcon=hd))
         return True
+
+    def notify(self, title, msg, pil_img, key):
+        """Powiadomienie z własną ikoną (zielona = OK, czerwona = problem) zamiast ikony,
+        którą Windows zapamiętał dla aplikacji."""
+        if not self.icon._hwnd:
+            return False
+        big = self.ct.windll.user32.GetSystemMetrics(11) or 32   # SM_CXICON
+        hd = self.hicon(("balloon", key), pil_img, size=big)
+        w32 = self.w32
+        nid = w32.NOTIFYICONDATAW(cbSize=self.ct.sizeof(w32.NOTIFYICONDATAW), hWnd=self.icon._hwnd, uID=0,
+                                  uFlags=0x10, szInfo=msg, szInfoTitle=title)   # NIF_INFO
+        if hd:
+            nid.dwInfoFlags = 0x4 | 0x20      # NIIF_USER | NIIF_LARGE_ICON
+            nid.hBalloonIcon = hd
+        return bool(w32.Shell_NotifyIcon(w32.NIM_MODIFY, nid))
 
     def icon_rect(self):
         try:
@@ -2657,9 +2748,14 @@ class App:
     def run(self):
         import pystray
         self.pystray = pystray
+        try:
+            refresh_autostart()
+        except Exception as e:
+            app_log(f"refresh_autostart: {e!r}")
         self.core.start()
         title = "" if IS_WIN else f"{APP_NAME} – uruchamianie…"
-        self.icon = pystray.Icon(APP_NAME, make_icon("wait"), title, menu=self._menu())
+        # na start logo TrayKopii (Windows zapamiętuje ikonę aplikacji – niech to nie będzie chwilowy stan)
+        self.icon = pystray.Icon(APP_NAME, app_logo_image(), title, menu=self._menu())
         self.wintray = None
         self.tip = None
         if IS_WIN:
@@ -2907,11 +3003,20 @@ class App:
             if self.icon.title != tip:
                 self.icon.title = tip
 
-    def notify(self, title, msg):
+    def notify(self, title, msg, kind=None):
+        """kind: "ok", "error", "warn", "off" albo None (logo TrayKopii)."""
         if not self.core.store.settings.get("notifications", True) or not self.icon:
             return
+        msg, title = msg[:250], title[:60] or APP_NAME
+        if self.wintray:
+            try:
+                img = make_icon(kind, size=64) if kind else app_logo_image()
+                if self.wintray.notify(title, msg, img, kind or "logo"):
+                    return
+            except Exception as e:
+                app_log(f"notify: {e!r}")
         try:
-            self.icon.notify(msg[:250], title[:60] or APP_NAME)
+            self.icon.notify(msg, title)
         except Exception:
             pass
 
@@ -2926,7 +3031,7 @@ class App:
                 self.kopiaui_off_since = now
             elif now - self.kopiaui_off_since > timedelta(minutes=2) and not self.notified.get("kopiaui_off"):
                 self.notified["kopiaui_off"] = True
-                self.notify(_("KopiaUI nie działa"), _("Kopie według harmonogramu nie będą się robić, dopóki nie uruchomisz KopiaUI."))
+                self.notify(_("KopiaUI nie działa"), _("Kopie według harmonogramu nie będą się robić, dopóki nie uruchomisz KopiaUI."), "off")
         else:
             self.kopiaui_off_since = None
             self.notified.pop("kopiaui_off", None)
@@ -2958,14 +3063,14 @@ class App:
             if key not in st_diag:
                 st_diag.append(key)
                 self.core.store.save_state()
-                self.notify(_("TrayKopia – diagnostyka"), text)
+                self.notify(_("TrayKopia – diagnostyka"), text, "warn")
         if self.mute_notify_once:      # po zmianie języka teksty się zmieniły – nie powiadamiaj ponownie
             self.mute_notify_once = False
             return
         if len(new_err) == 1:
-            self.notify(_("Kopia: {n}", n=new_err[0][0]), new_err[0][1])
+            self.notify(_("Kopia: {n}", n=new_err[0][0]), new_err[0][1], "error")
         elif new_err:
-            self.notify(_("Kopia: problemy ({n})", n=len(new_err)), "; ".join(f"{n}: {t}" for n, t in new_err))
+            self.notify(_("Kopia: problemy ({n})", n=len(new_err)), "; ".join(f"{n}: {t}" for n, t in new_err), "error")
 
     def _on_core_event(self, what, repo, kind, rec):
         if what == "verify":
@@ -2975,10 +3080,10 @@ class App:
             if rec.get("ok"):
                 if not rec.get("auto"):
                     self.ui(self.notify, f"{repo.name}: {name} OK",
-                            _("Bez błędów. Przeczytano {n} plików ({b}).", n=rec.get('read_files') or 0, b=fmt_bytes(rec.get('read_bytes') or 0)))
+                            _("Bez błędów. Przeczytano {n} plików ({b}).", n=rec.get('read_files') or 0, b=fmt_bytes(rec.get('read_bytes') or 0)), "ok")
             else:
                 msg = rec.get("error") or "; ".join(rec.get("error_strings") or [])[:200] or _("wykryto błędy")
-                self.ui(self.notify, f"{repo.name}: {name} – " + _("PROBLEM"), msg)
+                self.ui(self.notify, f"{repo.name}: {name} – " + _("PROBLEM"), msg, "error")
 
     # --- menu w zasobniku ---
     def _menu(self):
@@ -3086,7 +3191,7 @@ class App:
         try:
             set_autostart(not autostart_enabled())
         except Exception as e:
-            self.notify(APP_NAME, _("Nie udało się zmienić autostartu: {e}", e=e))
+            self.notify(APP_NAME, _("Nie udało się zmienić autostartu: {e}", e=e), "error")
         if self.icon:
             self.icon.update_menu()
 
@@ -3102,12 +3207,12 @@ class App:
         if not exe or not os.path.exists(exe):
             exe = next((p for p in default_kopiaui_candidates() if os.path.exists(p)), None)
         if not exe:
-            self.notify(APP_NAME, _("Nie znaleziono KopiaUI.exe."))
+            self.notify(APP_NAME, _("Nie znaleziono KopiaUI.exe."), "error")
             return
         try:
             subprocess.Popen([exe], creationflags=0, close_fds=True)
         except Exception as e:
-            self.notify(APP_NAME, _("Nie udało się uruchomić KopiaUI: {e}", e=e))
+            self.notify(APP_NAME, _("Nie udało się uruchomić KopiaUI: {e}", e=e), "error")
 
     def quit(self):
         try:
