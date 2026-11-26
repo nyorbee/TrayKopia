@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover
     croniter = None
 
 APP_NAME = "TrayKopia"
-APP_VERSION = "1.4.4"
+APP_VERSION = "1.5.0"
 URL_FACEBOOK = "https://www.facebook.com/ajtiguy"
 URL_GITHUB = "https://github.com/nyorbee"
 
@@ -54,6 +54,10 @@ OK, INFO, WAIT, WARN, ERROR = 0, 1, 2, 4, 5
 # --- język (domyślnie angielski; wybór zapamiętany w ustawieniach) ---
 # Słownik: polski szablon -> angielski
 EN = {
+    'KopiaUI działa z uprawnieniami administratora, a TrayKopia bez nich – nie widzi, co robi KopiaUI. Uruchamiaj oba programy tak samo (oba zwykle albo oba jako administrator).': "KopiaUI runs as administrator but TrayKopia does not, so it can't see what KopiaUI is doing. Run both the same way (both normally or both as administrator).",
+    'KopiaUI nie zapamiętała hasła do tego repozytorium, więc TrayKopia nie może go odczytać.': 'KopiaUI did not save the password for this repository, so TrayKopia cannot read it.',
+    'wstrzymane w KopiaUI – kopie według harmonogramu się nie robią': 'paused in KopiaUI – scheduled backups are not happening',
+    'Źródło zostało wstrzymane (Pause) w KopiaUI. Wznów je (Resume), żeby harmonogram znów działał.': 'The source was paused in KopiaUI. Resume it so the schedule works again.',
     'Kopia: {v} (testowana: {t})': 'Kopia: {v} (tested: {t})',
     'Nie znaleziono logów KopiaUI dla: {r}. Postęp kopii i błędy snapshotów będą widoczne tylko częściowo.': 'KopiaUI logs not found for: {r}. Backup progress and snapshot errors will only be partly visible.',
     'TrayKopia może pokazywać niepełne informacje – szczegóły w oknie stanu.': 'TrayKopia may show incomplete information – see the status window.',
@@ -521,16 +525,31 @@ def _strip_cron(expr):
     return expr.split("#", 1)[0].strip()
 
 
+def at_local(day, h, m):
+    """Godzina h:m danego dnia w czasie lokalnym (poprawnie w dni zmiany czasu letni/zimowy)."""
+    return datetime(day.year, day.month, day.day, int(h), int(m)).astimezone()
+
+
+_GO_ZERO_TO_UNIX = 62135596800   # sekundy od „zerowego czasu” Go (1.01.0001) do 1.01.1970
+
+
+def kopia_interval_next(prev, iv):
+    """Jak Kopia: (poprzedni + interwał) obcięty do wielokrotności interwału (time.Truncate w Go)."""
+    t = prev + timedelta(seconds=iv)
+    secs = t.timestamp() + _GO_ZERO_TO_UNIX
+    aligned = secs - (secs % iv)
+    return datetime.fromtimestamp(aligned - _GO_ZERO_TO_UNIX).astimezone()
+
+
 def last_due(sched, now, last_snapshot=None):
     """Ostatni zaplanowany termin <= now (albo None, gdy brak harmonogramu)."""
     if not sched or sched.get("manual"):
         return None
     cands = []
     for tod in sched.get("timeOfDay") or []:
-        d = now.replace(hour=int(tod.get("hour", 0)), minute=int(tod.get("min", 0)),
-                        second=0, microsecond=0)
+        d = at_local(now, tod.get("hour", 0), tod.get("min", 0))
         if d > now:
-            d -= timedelta(days=1)
+            d = at_local(now - timedelta(days=1), tod.get("hour", 0), tod.get("min", 0))
         cands.append(d)
     if croniter:
         for expr in sched.get("cron") or []:
@@ -540,7 +559,7 @@ def last_due(sched, now, last_snapshot=None):
                 pass
     iv = int(sched.get("intervalSeconds") or 0)
     if iv > 0 and last_snapshot:
-        d = last_snapshot + timedelta(seconds=iv)
+        d = kopia_interval_next(last_snapshot, iv)
         if d <= now:
             cands.append(d)
     return max(cands) if cands else None
@@ -551,10 +570,9 @@ def next_due(sched, now, last_snapshot=None):
         return None
     cands = []
     for tod in sched.get("timeOfDay") or []:
-        d = now.replace(hour=int(tod.get("hour", 0)), minute=int(tod.get("min", 0)),
-                        second=0, microsecond=0)
+        d = at_local(now, tod.get("hour", 0), tod.get("min", 0))
         if d <= now:
-            d += timedelta(days=1)
+            d = at_local(now + timedelta(days=1), tod.get("hour", 0), tod.get("min", 0))
         cands.append(d)
     if croniter:
         for expr in sched.get("cron") or []:
@@ -564,7 +582,7 @@ def next_due(sched, now, last_snapshot=None):
                 pass
     iv = int(sched.get("intervalSeconds") or 0)
     if iv > 0:
-        d = (last_snapshot + timedelta(seconds=iv)) if last_snapshot else now
+        d = kopia_interval_next(last_snapshot, iv) if last_snapshot else now
         cands.append(max(d, now))
     return min(cands) if cands else None
 
@@ -597,7 +615,7 @@ def weekly_last_due(days, hhmm, now):
         return None
     h, m = parse_hhmm(hhmm)
     for back in range(0, 8):
-        d = (now - timedelta(days=back)).replace(hour=h, minute=m, second=0, microsecond=0)
+        d = at_local(now - timedelta(days=back), h, m)
         if d.weekday() in days and d <= now:
             return d
     return None
@@ -608,7 +626,7 @@ def weekly_next_due(days, hhmm, now):
         return None
     h, m = parse_hhmm(hhmm)
     for fwd in range(0, 8):
-        d = (now + timedelta(days=fwd)).replace(hour=h, minute=m, second=0, microsecond=0)
+        d = at_local(now + timedelta(days=fwd), h, m)
         if d.weekday() in days and d > now:
             return d
     return None
@@ -617,20 +635,20 @@ def weekly_next_due(days, hhmm, now):
 def monthly_last_due(day, hhmm, now):
     h, m = parse_hhmm(hhmm)
     day = max(1, min(28, int(day)))
-    d = now.replace(day=day, hour=h, minute=m, second=0, microsecond=0)
+    d = at_local(now.replace(day=day), h, m)
     if d > now:
         prev_month_end = now.replace(day=1) - timedelta(days=1)
-        d = prev_month_end.replace(day=day, hour=h, minute=m, second=0, microsecond=0)
+        d = at_local(prev_month_end.replace(day=day), h, m)
     return d
 
 
 def monthly_next_due(day, hhmm, now):
     h, m = parse_hhmm(hhmm)
     day = max(1, min(28, int(day)))
-    d = now.replace(day=day, hour=h, minute=m, second=0, microsecond=0)
+    d = at_local(now.replace(day=day), h, m)
     if d <= now:
         nm = (now.replace(day=28) + timedelta(days=5)).replace(day=day)
-        d = nm.replace(hour=h, minute=m, second=0, microsecond=0)
+        d = at_local(nm, h, m)
     return d
 
 
@@ -746,11 +764,21 @@ class Kopia:
     def run_json(self, repo, args, timeout=300):
         rc, out, err = self.run(repo, args + ["--json"], timeout)
         if rc != 0:
-            raise RuntimeError(clean_error(err) or _("kopia zakończyła się kodem {rc}", rc=rc))
+            msg = clean_error(err) or _("kopia zakończyła się kodem {rc}", rc=rc)
+            if "password" in msg.lower():
+                msg += " – " + _("KopiaUI nie zapamiętała hasła do tego repozytorium, więc TrayKopia nie może go odczytać.")
+            raise RuntimeError(msg)
         out = out.strip()
         if not out:
             return []
-        return json.loads(out)
+        try:
+            return json.loads(out)
+        except ValueError:
+            # na wypadek komunikatów wypisanych przed JSON-em
+            starts = [i for i in (out.find("["), out.find("{")) if i >= 0]
+            if not starts:
+                raise
+            return json.loads(out[min(starts):])
 
 
 def clean_error(err):
@@ -974,6 +1002,9 @@ class LogEvents:
 
     def __init__(self):
         self.snap_running = False
+        self.running_n = 0                # ile snapshotów trwa naraz (przy równoległych źródłach)
+        self.pid = None                   # proces KopiaUI, z którego są te zdarzenia
+        self.paused = False               # źródło wstrzymane w KopiaUI (Pause)
         self.snap_started = None
         self.snap_read_base = None        # read_bytes procesu w chwili startu snapshotu
         self.last_end = None
@@ -1027,6 +1058,10 @@ def parse_log_line(line):
         return ts, "error", rest[i + len("snapshot error:"):].strip()[:400]
     if "created snapshot " in rest and "Created snapshot" not in rest:
         return ts, "created", ""
+    if "pause triggered via API" in rest:
+        return ts, "pause", ""
+    if "resume triggered via API" in rest:
+        return ts, "resume", ""
     if "maintenance task failed" in rest:
         m = re.search(r'"err"\s*:\s*"([^"]*)"', rest)
         return ts, "maint_error", (m.group(1) if m else rest)[:300]
@@ -1056,6 +1091,13 @@ class LogTail:
                 size = os.path.getsize(f)
             except OSError:
                 continue
+            if f not in self.offsets:
+                try:
+                    if time.time() - os.path.getmtime(f) > 2 * 86400:
+                        self.offsets[f] = (size, "")     # stary segment – nic aktualnego w nim nie ma
+                        continue
+                except OSError:
+                    continue
             pos, partial = self.offsets.get(f, (0, ""))
             if size < pos:
                 pos, partial = 0, ""
@@ -1120,6 +1162,15 @@ class Status:
 def eval_source(src, ev, proc, kopiaui_running, now, server_age=None, alarm_cfg=None, acked=()):
     """Stan jednego folderu + alarm podejrzanych zmian."""
     st = _eval_source(src, ev, proc, kopiaui_running, now, server_age)
+    # proces KopiaUI intensywnie pracuje, choć w logu nie ma startu snapshotu (konserwacja albo nieznany format logu)
+    # – pokazujemy pracę tylko wtedy, gdy nie zasłoni to problemu
+    if (not st.running and st.level <= WAIT and proc and getattr(proc, "busy_since", None)
+            and now - proc.busy_since > timedelta(seconds=10)):
+        busy = Status(INFO, _("Kopia pracuje (odczyt {r}, zapis {w})", r=fmt_rate(proc.read_rate), w=fmt_rate(proc.write_rate)),
+                      running=True, detail=st.detail + [_("Proces KopiaUI intensywnie pracuje – kopia albo konserwacja repozytorium.")])
+        busy.progress = {"kind": "busy", "pct": None, "done": None, "total": None,
+                         "rate": proc.read_rate + proc.write_rate, "since": proc.busy_since}
+        st = busy
     alarms = suspicious_changes(src, now, alarm_cfg, acked)
     if alarms:
         a = alarms[-1]
@@ -1195,12 +1246,10 @@ def _eval_source(src, ev, proc, kopiaui_running, now, server_age=None):
         st = Status(INFO, txt, running=True, detail=det)
         st.progress = prog
         return st
-    if proc and proc.busy_since and now - proc.busy_since > timedelta(seconds=10):
-        st = Status(INFO, _("Kopia pracuje (odczyt {r}, zapis {w})", r=fmt_rate(proc.read_rate), w=fmt_rate(proc.write_rate)),
-                    running=True, detail=det + [_("Proces KopiaUI intensywnie pracuje – kopia albo konserwacja repozytorium.")])
-        st.progress = {"kind": "busy", "pct": None, "done": None, "total": None,
-                       "rate": proc.read_rate + proc.write_rate, "since": proc.busy_since}
-        return st
+
+    if ev and ev.paused and proc:
+        return Status(WARN, _("wstrzymane w KopiaUI – kopie według harmonogramu się nie robią"),
+                      detail=det + [_("Źródło zostało wstrzymane (Pause) w KopiaUI. Wznów je (Resume), żeby harmonogram znów działał.")])
 
     sched = src.sched
     if sched is None and src.policy_error:
@@ -1613,6 +1662,8 @@ class Core:
         self.app_start = now_local()
         self.extra_cfg_dirs = set()        # dodatkowe katalogi configów (KopiaUI portable)
         self.size_cache = {}               # ścieżka -> rozmiar folderu (do postępu pierwszego snapshotu)
+        self.denied_servers = 0            # procesy kopia, do których nie mamy dostępu (KopiaUI jako administrator)
+        self.refresh_fail = {}             # repo_id -> liczba nieudanych odczytów z rzędu
         self.size_jobs = set()
         self._rediscover_now = False
         self.kopia_version = None          # (major, minor, patch, tekst)
@@ -1656,6 +1707,7 @@ class Core:
         ui_exe = None
         servers = {}
         cfg_dirs = set()
+        denied = 0
         for p in psutil.process_iter(["pid", "name", "cmdline", "create_time"]):
             try:
                 name = (p.info.get("name") or "").lower()
@@ -1668,7 +1720,10 @@ class Core:
                     continue
                 if name not in ("kopia.exe", "kopia"):
                     continue
-                cl = p.info.get("cmdline") or []
+                cl = p.info.get("cmdline")
+                if cl is None:          # brak dostępu (proces innego użytkownika / administratora)
+                    denied += 1
+                    continue
                 if "server" not in cl or "start" not in cl:
                     continue
                 cfg = None
@@ -1718,6 +1773,7 @@ class Core:
                 continue
         with self.lock:
             self.procs = servers
+            self.denied_servers = denied
             if found_ui and not self.kopiaui_running:
                 self.kopiaui_since = now
             self.kopiaui_running = found_ui
@@ -1748,6 +1804,13 @@ class Core:
             if not repo:
                 continue
             ev = self.events.setdefault(repo.id, LogEvents())
+            if ev.pid != sp.pid:
+                # nowy proces KopiaUI (np. restart w trakcie kopii) – stan „trwa” i „pauza” nie przechodzą
+                ev.pid = sp.pid
+                ev.running_n = 0
+                ev.snap_running = False
+                ev.paused = False
+                changed = True
             if not ev.log_files and (ev.log_files is None or now_local() - sp.started > timedelta(minutes=2)):
                 ev.log_files = self.tail.has_files(sp.pid, sp.log_dir)
             for ts, kind, txt in self.tail.read_new(sp.pid, sp.log_dir):
@@ -1755,12 +1818,14 @@ class Core:
                     continue
                 changed = True
                 if kind == "start":
+                    ev.running_n += 1
                     ev.snap_running = True
                     ev.snap_started = ts
                     self.request_refresh(repo.id)
                     ev.snap_read_base = sp.read_total if (now_local() - ts) < timedelta(seconds=30) else None
                 elif kind in ("created", "identical", "error"):
-                    ev.snap_running = False
+                    ev.running_n = max(0, ev.running_n - 1)
+                    ev.snap_running = ev.running_n > 0
                     ev.last_end, ev.last_end_kind = ts, kind
                     ev.end_times.append(ts)
                     del ev.end_times[:-100]
@@ -1771,11 +1836,15 @@ class Core:
                     self.request_refresh(repo.id)
                 elif kind == "maint_error":
                     ev.maint_error, ev.maint_error_msg = ts, txt
+                elif kind in ("pause", "resume"):
+                    ev.paused = kind == "pause"
             # proces padł w trakcie snapshotu
         for rid, ev in self.events.items():
             r = self.repo_by_id(rid)
-            if ev.snap_running and (not r or r.key not in self.procs):
+            if (ev.snap_running or ev.paused) and (not r or r.key not in self.procs):
                 ev.snap_running = False
+                ev.running_n = 0
+                ev.paused = False
                 changed = True
         if changed:
             with self.store.lock:
@@ -1852,6 +1921,8 @@ class Core:
                 if not any(lo <= t <= hi for t in ev.end_times):
                     mismatch.append(r.name)
                     break
+        if self.denied_servers and self.kopiaui_running:
+            out.append(("admin", _("KopiaUI działa z uprawnieniami administratora, a TrayKopia bez nich – nie widzi, co robi KopiaUI. Uruchamiaj oba programy tak samo (oba zwykle albo oba jako administrator).")))
         if no_logs:
             out.append(("nologs", _("Nie znaleziono logów KopiaUI dla: {r}. Postęp kopii i błędy snapshotów będą widoczne tylko częściowo.",
                                     r=", ".join(no_logs))))
@@ -1918,8 +1989,9 @@ class Core:
                     continue
                 self.refreshing = rid
                 self.request_ui_update()
+                prev = self.data.get(rid)
                 try:
-                    d = fetch_repo_data(self.kopia, repo, self.data.get(rid))
+                    d = fetch_repo_data(self.kopia, repo, prev)
                     self._check_identical_changes(repo, d)
                     for s in d.sources:
                         if not s.last_complete and s.est_size is None:
@@ -1930,6 +2002,17 @@ class Core:
                     d = RepoData()
                     d.error = _("Błąd odczytu: {e}", e=e)
                     d.refreshed = now_local()
+                if d.error:
+                    n = self.refresh_fail.get(rid, 0) + 1
+                    self.refresh_fail[rid] = n
+                    if prev and not prev.error and n < 3:
+                        # pojedynczy błąd (np. chwilowa blokada) – zostaw poprzednie dane i spróbuj za 2 min
+                        app_log(f"refresh {repo.name}: {d.error} (próba {n}, zostawiam poprzednie dane)")
+                        threading.Timer(120, self.request_refresh, args=(rid,)).start()
+                        self.refreshing = None
+                        continue
+                else:
+                    self.refresh_fail.pop(rid, None)
                 with self.lock:
                     self.data[rid] = d
                 self.refreshing = None
@@ -2442,19 +2525,41 @@ class TrayTip:
             self.u.ShowWindow(self.hwnd, 0)
             self.visible = False
 
+    def _monitor(self, x, y):
+        """Obszar monitora, na którym jest ikona (przy kilku monitorach i pasku zadań na drugim ekranie)."""
+        try:
+            import ctypes
+            from ctypes import wintypes as wt
+
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", wt.RECT), ("rcWork", wt.RECT), ("dwFlags", wt.DWORD)]
+            u = ctypes.WinDLL("user32")
+            u.MonitorFromPoint.argtypes = [wt.POINT, wt.DWORD]
+            u.MonitorFromPoint.restype = wt.HANDLE
+            u.GetMonitorInfoW.argtypes = [wt.HANDLE, ctypes.POINTER(MONITORINFO)]
+            h = u.MonitorFromPoint(wt.POINT(int(x), int(y)), 2)     # MONITOR_DEFAULTTONEAREST
+            mi = MONITORINFO()
+            mi.cbSize = ctypes.sizeof(MONITORINFO)
+            if h and u.GetMonitorInfoW(h, ctypes.byref(mi)):
+                r = mi.rcMonitor
+                return r.left, r.top, r.right, r.bottom
+        except Exception:
+            pass
+        return 0, 0, self.w.winfo_screenwidth(), self.w.winfo_screenheight()
+
     def _place(self, show):
         self.w.update_idletasks()
         tw, th = self.w.winfo_reqwidth(), self.w.winfo_reqheight()
         l, t, r, b = self.anchor_rect
-        sw, sh = self.w.winfo_screenwidth(), self.w.winfo_screenheight()
+        ml, mt, mr, mb = self._monitor((l + r) / 2, (t + b) / 2)
         x = int((l + r) / 2 - tw / 2)
-        y = t - th - 10 if t - th - 10 > 0 else b + 10       # pasek zadań na dole albo na górze
-        if l < 120 and t > 120 and b < sh - 120:               # pasek z boku
+        y = t - th - 10 if t - th - 10 > mt else b + 10        # pasek zadań na dole albo na górze
+        if l < ml + 120 and t > mt + 120 and b < mb - 120:     # pasek z lewej
             x, y = r + 10, int((t + b) / 2 - th / 2)
-        elif r > sw - 120 and t > 120 and b < sh - 120:
+        elif r > mr - 120 and t > mt + 120 and b < mb - 120:   # pasek z prawej
             x, y = l - tw - 10, int((t + b) / 2 - th / 2)
-        x = max(4, min(x, sw - tw - 4))
-        y = max(4, min(y, sh - th - 4))
+        x = max(ml + 4, min(x, mr - tw - 4))
+        y = max(mt + 4, min(y, mb - th - 4))
         if (x, y) != self.pos:
             self.w.geometry(f"+{x}+{y}")
             self.pos = (x, y)
@@ -2544,6 +2649,8 @@ class App:
         self.icons = {}
         self.mount_win = None
         self.mute_notify_once = False
+        self.started_at = now_local()
+        self.kopiaui_seen_at = None
         LANG["code"] = self.core.store.settings.get("language", "en") if self.core.store.settings.get("language") in ("en", "pl") else "en"
 
     # --- uruchomienie ---
@@ -2811,7 +2918,10 @@ class App:
     def _notify_changes(self):
         s = self.snap
         now = s["now"]
+        if s["kopiaui"] and self.kopiaui_seen_at is None:
+            self.kopiaui_seen_at = s["now"]
         if not s["kopiaui"]:
+            self.kopiaui_seen_at = None
             if self.kopiaui_off_since is None:
                 self.kopiaui_off_since = now
             elif now - self.kopiaui_off_since > timedelta(minutes=2) and not self.notified.get("kopiaui_off"):
@@ -2828,6 +2938,13 @@ class App:
             if st.level >= ERROR and not st.running:
                 if r["data"] is None:
                     continue
+                if not s["kopiaui"]:
+                    # brak KopiaUI zgłaszamy jednym powiadomieniem (po 2 min) – nie zasypujemy błędami każdego repozytorium,
+                    # np. przy starcie Windows, gdy TrayKopia wystartuje przed KopiaUI
+                    continue
+                if (s["now"] - self.started_at) < timedelta(minutes=3) and self.kopiaui_seen_at and \
+                        (s["now"] - self.kopiaui_seen_at) < timedelta(minutes=SERVER_WARMUP_MINUTES):
+                    continue          # KopiaUI dopiero co wystartowała – daj jej nadrobić zaległe kopie
                 if self.notified.get(k) != st.text:
                     self.notified[k] = st.text
                     new_err.append((r["repo"].name, st.text))
