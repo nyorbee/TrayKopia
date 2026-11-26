@@ -46,7 +46,7 @@ KopiaUI must be running for its scheduler to make backups – TrayKopia shows a 
 Put `created.png` (banner) next to `traykopia.py`, then:
 
 ```
-python -m nuitka --onefile --onefile-tempdir-spec="{CACHE_DIR}/{COMPANY}/{PRODUCT}/{VERSION}" --onefile-cache-mode=cached --windows-console-mode=disable --enable-plugin=tk-inter --include-module=pystray._win32 --include-data-files=created.png=created.png --include-data-files=traykopia.ico=traykopia.ico --windows-icon-from-ico=traykopia.ico --company-name=nyorbee --product-name=TrayKopia --file-version=1.4.2 --product-version=1.4.2 --file-description="TrayKopia - Kopia backup status" --output-filename=TrayKopia.exe traykopia.py
+python -m nuitka --onefile --onefile-tempdir-spec="{CACHE_DIR}/{COMPANY}/{PRODUCT}/{VERSION}" --onefile-cache-mode=cached --windows-console-mode=disable --enable-plugin=tk-inter --include-module=pystray._win32 --include-data-files=created.png=created.png --include-data-files=traykopia.ico=traykopia.ico --windows-icon-from-ico=traykopia.ico --company-name=nyorbee --product-name=TrayKopia --file-version=1.4.3 --product-version=1.4.3 --file-description="TrayKopia - Kopia backup status" --output-filename=TrayKopia.exe traykopia.py
 ```
 
 ## Disclaimer

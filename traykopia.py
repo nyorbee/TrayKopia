@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover
     croniter = None
 
 APP_NAME = "TrayKopia"
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.4.3"
 URL_FACEBOOK = "https://www.facebook.com/ajtiguy"
 URL_GITHUB = "https://github.com/nyorbee"
 
@@ -1292,6 +1292,12 @@ def eval_repo(repo, data, ev, proc, kopiaui_running, now, verify_rec, verify_run
     if data.error:
         return Status(ERROR, data.error, detail=detail), []
     if not data.sources:
+        if ev and ev.snap_running and proc:
+            st = Status(INFO, _("robi się kopia") + (_(" (od {t})", t=f"{ev.snap_started:%H:%M}") if ev.snap_started else ""),
+                        running=True, detail=detail)
+            st.progress = {"kind": "snapshot", "pct": None, "done": proc.read_total if ev.snap_started and ev.snap_started - proc.started < timedelta(minutes=5) else None,
+                           "total": None, "rate": proc.read_rate, "since": ev.snap_started}
+            return st, []
         return Status(WARN, _("brak folderów – dodaj snapshot w KopiaUI"), detail=detail), []
     server_age = (now - proc.started) if proc else None
     srcs = [(s, eval_source(s, ev, proc, kopiaui_running, now, server_age, alarm_cfg, acked)) for s in data.sources]
@@ -1747,6 +1753,7 @@ class Core:
                 if kind == "start":
                     ev.snap_running = True
                     ev.snap_started = ts
+                    self.request_refresh(repo.id)
                     ev.snap_read_base = sp.read_total if (now_local() - ts) < timedelta(seconds=30) else None
                 elif kind in ("created", "identical", "error"):
                     ev.snap_running = False
