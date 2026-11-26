@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover
     croniter = None
 
 APP_NAME = "TrayKopia"
-APP_VERSION = "1.4.3"
+APP_VERSION = "1.4.4"
 URL_FACEBOOK = "https://www.facebook.com/ajtiguy"
 URL_GITHUB = "https://github.com/nyorbee"
 
@@ -885,7 +885,7 @@ def fetch_repo_data(kopia, repo, prev=None):
     return d
 
 
-def folder_size(path, max_entries=3_000_000, max_seconds=90):
+def folder_size(path, max_entries=5_000_000, max_seconds=1800):
     """Rozmiar folderu (do szacowania postępu pierwszego snapshotu). None = nie udało się."""
     if not os.path.isdir(path):
         return None
@@ -1174,8 +1174,10 @@ def _eval_source(src, ev, proc, kopiaui_running, now, server_age=None):
         if proc.read_rate > 256 * 1024:
             txt += f", {fmt_rate(proc.read_rate)}"
         base = ev.snap_read_base
-        if base is None and ev.snap_started and ev.snap_started - proc.started < timedelta(minutes=5):
-            base = 0  # snapshot ruszył zaraz po starcie procesu – liczymy od zera
+        if base is None and (not last or (ev.snap_started and ev.snap_started - proc.started < timedelta(minutes=5))):
+            # Pierwszy snapshot (albo start zaraz po uruchomieniu procesu): proces KopiaUI tego repozytorium
+            # wcześniej prawie nic nie czytał, więc liczymy od zera – błąd to najwyżej kilkadziesiąt MB.
+            base = 0
         prog = {"kind": "snapshot", "pct": None, "done": None, "total": None,
                 "rate": proc.read_rate, "since": ev.snap_started}
         if base is not None:
@@ -1610,6 +1612,8 @@ class Core:
         self.mounts = MountManager(self)
         self.app_start = now_local()
         self.extra_cfg_dirs = set()        # dodatkowe katalogi configów (KopiaUI portable)
+        self.size_cache = {}               # ścieżka -> rozmiar folderu (do postępu pierwszego snapshotu)
+        self.size_jobs = set()
         self._rediscover_now = False
         self.kopia_version = None          # (major, minor, patch, tekst)
         self._version_for_exe = None
@@ -1919,7 +1923,9 @@ class Core:
                     self._check_identical_changes(repo, d)
                     for s in d.sources:
                         if not s.last_complete and s.est_size is None:
-                            s.est_size = folder_size(s.path)
+                            s.est_size = self.size_cache.get(s.path)
+                            if s.est_size is None:
+                                self._start_size_job(s.path)
                 except Exception as e:
                     d = RepoData()
                     d.error = _("Błąd odczytu: {e}", e=e)
@@ -1928,6 +1934,27 @@ class Core:
                     self.data[rid] = d
                 self.refreshing = None
                 self.request_ui_update()
+
+    def _start_size_job(self, path):
+        """Policz rozmiar folderu w osobnym wątku (na zajętym HDD może to potrwać kilka minut)."""
+        with self.lock:
+            if path in self.size_jobs:
+                return
+            self.size_jobs.add(path)
+
+        def job():
+            size = folder_size(path)
+            with self.lock:
+                self.size_jobs.discard(path)
+                if size is not None:
+                    self.size_cache[path] = size
+                    for d in self.data.values():
+                        for s in (d.sources if d else []):
+                            if s.path == path and s.est_size is None:
+                                s.est_size = size
+            self.request_ui_update()
+
+        threading.Thread(target=job, daemon=True, name="size").start()
 
     def _check_identical_changes(self, repo, d):
         """Folder z Ignore Identical: czy coś się zmieniło od ostatniego snapshotu (gdy brak info z logów)."""
